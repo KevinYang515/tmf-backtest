@@ -84,11 +84,14 @@ def load_scalp():
 
 @st.cache_data(ttl=300)
 def load_stock_scalp():
-    p = DATA_DIR / "results_stock_scalp.csv"
+    p = DATA_DIR / "results_stock_scalp_1min.csv"
     if not p.exists():
-        return pd.DataFrame()
+        p = DATA_DIR / "results_stock_scalp.csv"
+    if not p.exists():
+        return pd.DataFrame(), False
     df = pd.read_csv(p, encoding="utf-8-sig")
-    return df
+    is_1min = "time_window" in df.columns
+    return df, is_1min
 
 
 def kpi_card(label: str, value: str, sub: str = "", cls: str = ""):
@@ -387,116 +390,148 @@ with tab_c:
     st.markdown("""
     - **選股**：前一日漲幅前 30 名（市值 > 500 億，價格 100-200 或 1000-2000）
     - **MXF 方向濾網**：08:46–08:59 偏多才交易
-    - **進場**：開盤買入（漲停略過）
-    - **停利**：開盤價 + N tick（台股 tick 制度）
-    - **停損**：當日收盤市價平（純時間停損）
+    - **進場**：09:01 開盤第一根 K 棒（漲停略過）
+    - **停利**：進場後 N tick，於時間窗口（5/10/15 min）內到達即觸發
+    - **停損**：時間到市價平（純時間停損）
     - **手續費**：1.6折 + 當沖稅減半（買 0.0228% + 賣 0.1728%）
     """)
 
     st.markdown("""
-    <div style="background:#1c2128;border:1px solid #f0883e;border-radius:8px;padding:12px 16px;margin:8px 0;">
-    ⚠️ <strong>注意：本策略使用日頻最高價判斷 TP，為全天上限估計（過度樂觀）。</strong><br>
-    實際早盤 5–15 分鐘命中率更低。後續將以 1 分鐘 K 棒重跑，得到更精確結果。
+    <div style="background:#1c2128;border:1px solid #f85149;border-radius:8px;padding:12px 16px;margin:8px 0;">
+    <strong>Gap-Fade 效應確認：</strong> 前日強勢股在開盤後持續回落（gap-fade）。
+    做多策略全面虧損，TIMEOUT 平均損失遠超 TP 收益。<br>
+    <strong>建議方向：反向做空（先賣後買）或改用均值回歸做多前日弱勢股。</strong>
     </div>
     """, unsafe_allow_html=True)
 
-    rdf_c = load_stock_scalp()
+    rdf_c, is_1min = load_stock_scalp()
     if rdf_c.empty:
         st.info("回測資料尚未載入")
     else:
-        # ── KPI ──
-        ticks = sorted(rdf_c["tick"].unique().tolist()) if "tick" in rdf_c.columns else []
-        total_trades = len(rdf_c) // max(len(ticks), 1)
-        trade_days   = rdf_c["date"].nunique() if "date" in rdf_c.columns else 0
-        stocks       = rdf_c["stock"].nunique() if "stock" in rdf_c.columns else 0
+        ticks    = sorted(rdf_c["tick"].unique().tolist()) if "tick" in rdf_c.columns else []
+        windows  = sorted(rdf_c["time_window"].unique().tolist()) if is_1min and "time_window" in rdf_c.columns else [None]
+        trade_days = rdf_c["date"].nunique() if "date" in rdf_c.columns else 0
+        stocks     = rdf_c["stock"].nunique() if "stock" in rdf_c.columns else 0
+        data_note  = "1 分鐘 K 棒（精確）" if is_1min else "日頻最高價（上限估算）"
 
         c1, c2, c3, c4 = st.columns(4)
-        c1.markdown(kpi_card("回測交易日", str(trade_days), "", ""), unsafe_allow_html=True)
-        c2.markdown(kpi_card("選股池", f"{stocks} 檔", "曾出現過", ""), unsafe_allow_html=True)
-        c3.markdown(kpi_card("Tick 目標", str(len(ticks)), "1~8 tick", ""), unsafe_allow_html=True)
-        c4.markdown(kpi_card("資料說明", "日頻上限", "非精確", "neu"), unsafe_allow_html=True)
+        c1.markdown(kpi_card("回測交易日", str(trade_days), "MXF 偏多日", ""), unsafe_allow_html=True)
+        c2.markdown(kpi_card("選股池", f"{stocks} 檔", "曾入選", ""), unsafe_allow_html=True)
+        c3.markdown(kpi_card("Tick 目標", f"{ticks[0]}~{ticks[-1]}", "1~8 tick", ""), unsafe_allow_html=True)
+        c4.markdown(kpi_card("資料品質", data_note, "", "pos" if is_1min else "neu"), unsafe_allow_html=True)
 
-        # ── Tick 目標彙總 ──
-        st.markdown('<div class="sec-header">各 Tick 目標彙總（日頻 TP 上限）</div>', unsafe_allow_html=True)
-        summary_rows = []
-        for n in ticks:
-            t = rdf_c[rdf_c["tick"] == n]
-            if t.empty:
-                continue
-            wins  = (t["pnl"] > 0).sum()
-            tp    = (t["result"] == "TP").sum()
-            total = len(t)
-            std   = t["pnl"].std()
-            sharpe = t["pnl"].mean() / std * np.sqrt(252) if std > 0 else 0
-            summary_rows.append({
-                "tick 目標": n,
-                "筆數":       total,
-                "TP 率":      f"{tp/total*100:.1f}%",
-                "勝率":       f"{wins/total*100:.1f}%",
-                "總損益(元)": int(t["pnl"].sum()),
-                "平均損益":   round(t["pnl"].mean(), 0),
-                "Sharpe":     round(sharpe, 2),
-            })
+        # ── 彙總表 ──
+        if is_1min:
+            st.markdown('<div class="sec-header">各 Tick × 時間窗口 表現（1-min K 棒）</div>', unsafe_allow_html=True)
+            sel_tw = st.selectbox("時間窗口（分鐘）", ["全部"] + [str(w) for w in windows], key="c_tw")
+            summary_rows = []
+            for n in ticks:
+                for tw in windows:
+                    t = rdf_c[(rdf_c["tick"] == n) & (rdf_c["time_window"] == tw)]
+                    if t.empty:
+                        continue
+                    wins   = (t["pnl"] > 0).sum()
+                    tp_n   = (t["result"] == "TP").sum()
+                    total  = len(t)
+                    std    = t["pnl"].std()
+                    sharpe = t["pnl"].mean() / std * np.sqrt(252) if std > 0 else 0
+                    summary_rows.append({
+                        "tick 目標":   n,
+                        "時間窗口(min)": tw,
+                        "筆數":         total,
+                        "TP 率":        f"{tp_n/total*100:.1f}%",
+                        "勝率":         f"{wins/total*100:.1f}%",
+                        "總損益(元)":   int(t["pnl"].sum()),
+                        "平均損益":     round(t["pnl"].mean(), 0),
+                        "Sharpe":       round(sharpe, 2),
+                    })
+        else:
+            st.markdown('<div class="sec-header">各 Tick 目標彙總（日頻 TP 上限）</div>', unsafe_allow_html=True)
+            sel_tw = "全部"
+            summary_rows = []
+            for n in ticks:
+                t = rdf_c[rdf_c["tick"] == n]
+                if t.empty:
+                    continue
+                wins  = (t["pnl"] > 0).sum()
+                tp_n  = (t["result"] == "TP").sum()
+                total = len(t)
+                std   = t["pnl"].std()
+                sharpe = t["pnl"].mean() / std * np.sqrt(252) if std > 0 else 0
+                summary_rows.append({
+                    "tick 目標":   n,
+                    "筆數":         total,
+                    "TP 率":        f"{tp_n/total*100:.1f}%",
+                    "勝率":         f"{wins/total*100:.1f}%",
+                    "總損益(元)":   int(t["pnl"].sum()),
+                    "平均損益":     round(t["pnl"].mean(), 0),
+                    "Sharpe":       round(sharpe, 2),
+                })
 
         if summary_rows:
             sdf = pd.DataFrame(summary_rows)
-            sdf["總損益(元)"] = sdf["總損益(元)"].apply(fmt_pnl)
-            styled_c = sdf.style \
+            if sel_tw != "全部" and "時間窗口(min)" in sdf.columns:
+                sdf = sdf[sdf["時間窗口(min)"] == int(sel_tw)]
+            sdf_disp = sdf.copy()
+            sdf_disp["總損益(元)"] = sdf_disp["總損益(元)"].apply(fmt_pnl)
+            styled_c = sdf_disp.style \
                 .map(color_sharpe, subset=["Sharpe"]) \
                 .map(color_wr, subset=["勝率"]) \
                 .map(color_pnl, subset=["總損益(元)"])
             st.dataframe(styled_c, use_container_width=True, hide_index=True)
 
-        # ── 月份穩定性（最佳 tick）──
+        # ── Gap-fade 解析 ──
+        st.markdown('<div class="sec-header">Gap-Fade 解析</div>', unsafe_allow_html=True)
+        col_ga, col_gb = st.columns(2)
+        with col_ga:
+            st.markdown("""
+            **為什麼持續虧損？**
+            - 前日強勢股已在收盤前充分反映漲幅
+            - 隔日開盤有溢價 gap，散戶追高後主力出貨
+            - 開盤後 5–15 分鐘通常回落（gap-fade）
+            - 手續費高（每筆約 0.2% round-trip）壓縮小 tick 利潤
+            """)
+        with col_gb:
+            st.markdown("""
+            **建議改進方向**
+            1. **做空** 前日強勢股（先賣後買當沖，需現股當沖資格）
+            2. **做多** 前日弱勢股（均值回歸，逆勢操作）
+            3. **等回落** 後進場（非開盤買，等 09:10–09:20 回測支撐）
+            4. **更大 tick 目標** + 更長窗口（減少手續費影響）
+            5. **換選股邏輯**：用法人買超、量能異常等因子
+            """)
+
+        # ── 月份穩定性 ──
         if summary_rows:
-            best_tick_row = max(summary_rows, key=lambda r: float(r["Sharpe"]))
-            best_tick = best_tick_row["tick 目標"]
-            with st.expander(f"月份穩定性（{best_tick} tick，展開）"):
-                t_best = rdf_c[rdf_c["tick"] == best_tick]
-                if "month" in t_best.columns:
-                    rows_m = []
-                    for month, mdf in t_best.groupby("month"):
-                        wins_m = (mdf["pnl"] > 0).sum()
-                        tp_m   = (mdf["result"] == "TP").sum()
-                        rows_m.append({
-                            "月份": month,
-                            "筆數": len(mdf),
-                            "TP 率": f"{tp_m/len(mdf)*100:.1f}%",
-                            "勝率": f"{wins_m/len(mdf)*100:.1f}%",
-                            "損益(元)": int(mdf["pnl"].sum()),
-                        })
-                    mdf_show = pd.DataFrame(rows_m)
-                    mdf_show["損益(元)"] = mdf_show["損益(元)"].apply(fmt_pnl)
-                    st.dataframe(mdf_show.style.map(color_pnl, subset=["損益(元)"]),
-                                 use_container_width=True, hide_index=True)
+            raw_rows = [r for r in summary_rows]
+            best_raw = max(raw_rows, key=lambda r: float(r.get("Sharpe", -99)))
+            best_tick = best_raw["tick 目標"]
+            best_tw_v = best_raw.get("時間窗口(min)", None)
+            label = f"{best_tick} tick" + (f" × {best_tw_v} min" if best_tw_v else "")
+            with st.expander(f"月份穩定性（{label}，展開）"):
+                if is_1min and best_tw_v:
+                    t_best = rdf_c[(rdf_c["tick"] == best_tick) & (rdf_c["time_window"] == best_tw_v)]
+                else:
+                    t_best = rdf_c[rdf_c["tick"] == best_tick]
+                rows_m = []
+                for month, mdf in t_best.groupby("month"):
+                    wins_m = (mdf["pnl"] > 0).sum()
+                    tp_m   = (mdf["result"] == "TP").sum()
+                    rows_m.append({
+                        "月份": month, "筆數": len(mdf),
+                        "TP 率": f"{tp_m/len(mdf)*100:.1f}%",
+                        "勝率": f"{wins_m/len(mdf)*100:.1f}%",
+                        "損益(元)": int(mdf["pnl"].sum()),
+                    })
+                mdf_show = pd.DataFrame(rows_m)
+                mdf_show["損益(元)"] = mdf_show["損益(元)"].apply(fmt_pnl)
+                st.dataframe(mdf_show.style.map(color_pnl, subset=["損益(元)"]),
+                             use_container_width=True, hide_index=True)
 
-        # ── 個股表現 ──
-        st.markdown('<div class="sec-header">個股表現（最佳 Tick）</div>', unsafe_allow_html=True)
-        if summary_rows:
-            t_best = rdf_c[rdf_c["tick"] == best_tick]
-            stock_perf = (t_best.groupby("stock")["pnl"]
-                          .agg(["sum", "count", "mean"])
-                          .rename(columns={"sum": "總損益", "count": "筆數", "mean": "平均損益"})
-                          .sort_values("總損益", ascending=False))
-            stock_perf["總損益"]   = stock_perf["總損益"].astype(int).apply(fmt_pnl)
-            stock_perf["平均損益"] = stock_perf["平均損益"].round(0)
-            st.dataframe(
-                stock_perf.head(20).style.map(color_pnl, subset=["總損益"]),
-                use_container_width=True
-            )
-
-        st.markdown("""
-        <div style="background:#1c2128;border:1px solid #388bfd;border-radius:8px;padding:10px 16px;margin:12px 0;font-size:13px;color:#8b949e;">
-        🔄 <strong>下一步：</strong>VM 正在拉取 45 檔大型股的 1 分鐘 K 棒（Shioaji）。
-        完成後將重跑策略 C，改用 5/10/15 分鐘窗口判斷 TP，結果將更接近實際。
-        </div>
-        """, unsafe_allow_html=True)
-
-    st.caption("完整明細可下載：results_stock_scalp.csv")
-    if not rdf_c.empty:
+        st.caption(f"資料來源：{'results_stock_scalp_1min.csv（1-min K 棒）' if is_1min else 'results_stock_scalp.csv（日頻上限）'}")
         st.download_button(
             "下載策略 C 明細 CSV",
             rdf_c.to_csv(index=False, encoding="utf-8-sig").encode("utf-8-sig"),
-            "results_stock_scalp.csv",
+            "results_stock_scalp_1min.csv" if is_1min else "results_stock_scalp.csv",
             "text/csv",
         )
