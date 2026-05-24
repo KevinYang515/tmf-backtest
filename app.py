@@ -1,8 +1,9 @@
 """
 TMF 微型台指期貨 — 回測結果儀表板
 策略 A：波動突破
-策略 B：固定時間進多 + 高掛 Limit
+策略 B：固定時間進多 + 高掛 Limit  ★ 主策略
 策略 C：前日強勢大型股（1-min K 棒）
+策略 D：台積電單股
 """
 
 import streamlit as st
@@ -46,6 +47,10 @@ st.markdown("""
     font-weight: 600;
     margin: 20px 0 8px;
 }
+
+.verdict-ok  { background:#1c2128; border:1px solid #3fb950; border-radius:8px; padding:10px 14px; margin:8px 0; }
+.verdict-warn{ background:#1c2128; border:1px solid #d29922; border-radius:8px; padding:10px 14px; margin:8px 0; }
+.verdict-bad { background:#1c2128; border:1px solid #f85149; border-radius:8px; padding:10px 14px; margin:8px 0; }
 
 [data-testid="stDataFrame"] { border: 1px solid #21262d; border-radius: 8px; }
 </style>
@@ -180,7 +185,6 @@ def apply_style(df_disp, sharpe_col=None, wr_col=None, pnl_cols=None, pf_col=Non
 
 
 def cumulative_chart(trades_df: pd.DataFrame, pnl_col: str, date_col: str = "date"):
-    """顯示按日期排序的逐筆損益 + 累積曲線"""
     if trades_df.empty or pnl_col not in trades_df.columns:
         st.info("無 trade-level 資料")
         return
@@ -188,7 +192,7 @@ def cumulative_chart(trades_df: pd.DataFrame, pnl_col: str, date_col: str = "dat
     tdf["累積損益"] = tdf[pnl_col].cumsum()
     tdf["日期"]     = pd.to_datetime(tdf[date_col])
     daily = tdf.groupby("日期")["累積損益"].last().reset_index()
-    st.line_chart(daily.set_index("日期"), height=260)
+    st.line_chart(daily.set_index("日期"), height=220)
 
 
 def monthly_table(trades_df: pd.DataFrame, pnl_col: str):
@@ -214,7 +218,6 @@ def monthly_table(trades_df: pd.DataFrame, pnl_col: str):
 
 
 def date_sorted_table(trades_df: pd.DataFrame, pnl_col: str, extra_cols: list = None):
-    """按日期排序的 trade 明細表"""
     if trades_df.empty:
         return pd.DataFrame()
     cols = ["date", "result", pnl_col] + (extra_cols or [])
@@ -224,12 +227,285 @@ def date_sorted_table(trades_df: pd.DataFrame, pnl_col: str, extra_cols: list = 
     return tdf
 
 
+def period_stats(df: pd.DataFrame, col: str = "pnl_twd") -> dict | None:
+    if df.empty or col not in df.columns:
+        return None
+    pnl    = df[col].astype(float)
+    std    = pnl.std()
+    sharpe = pnl.mean() / std * np.sqrt(252) if std > 0 else 0
+    wins   = (pnl > 0).sum()
+    losses = (pnl < 0).sum()
+    w_avg  = pnl[pnl > 0].mean() if wins else 0
+    l_avg  = pnl[pnl < 0].mean() if losses else 0
+    pf     = (w_avg * wins) / abs(l_avg * losses) if losses > 0 and l_avg != 0 else 99.0
+    return dict(
+        sharpe    = round(sharpe, 2),
+        total_pnl = int(pnl.sum()),
+        win_rate  = round(wins / len(df) * 100, 1),
+        pf        = round(pf, 2),
+        trades    = len(df),
+        ev        = round(pnl.mean(), 1),
+    )
+
+
+def sharpe_cls(s):
+    if s >= 2:   return "pos"
+    if s >= 0:   return "neu"
+    return "neg"
+
+
 # ════════════════════════════════════════════════════════════════════
 
 st.markdown("## 📊 TMF 微型台指期貨 — 回測儀表板")
-st.caption("資料期間：2026-02-23 ~ 2026-05-23（74 交易日）｜手續費：NT$40 round-trip（4 點）")
+st.caption("資料期間：2024-01-02 ~ 2026-05-23（708 交易日）｜手續費：NT$40 round-trip（4 點）")
 
-tab_a, tab_b, tab_c, tab_tsmc = st.tabs(["策略 A：波動突破", "策略 B：固定時間進多", "策略 C：前日強勢大型股", "策略 D：台積電單股"])
+tab_b, tab_a, tab_c, tab_tsmc = st.tabs(["⭐ 策略 B：固定時間進多", "策略 A：波動突破", "策略 C：前日強勢大型股", "策略 D：台積電單股"])
+
+
+# ════════════════════════════════════════════════════════════════════
+# TAB B  ★ 主策略
+# ════════════════════════════════════════════════════════════════════
+with tab_b:
+    sec("策略邏輯")
+    st.markdown("""
+    - **方向濾網**：08:46 用夜盤（前日 15:00～當日 05:00）；08:47~09:00 用 08:46～進場前盤前走勢
+    - **停利**：掛 Limit 在 entry + target 點；**停損**：可選無停損或固定停損
+    - **時間停損**：time_limit 根 K 棒後市價平
+    - **參數空間**：15 進場時間 × 8 目標 × 6 停損 × 5/6 時限 ≈ 3,600 組
+    """)
+
+    rdf_b, trades_b = load_scalp()
+
+    if rdf_b.empty:
+        st.info("回測資料尚未載入")
+    else:
+        best_b  = rdf_b.loc[rdf_b["sharpe"].idxmax()]
+        tp_b    = int(best_b["total_pnl"])
+        pf_b    = float(best_b.get("profit_factor", 0))
+        ev_b    = float(best_b.get("expect_val", best_b.get("avg_pnl", 0)))
+
+        c1,c2,c3,c4,c5,c6 = st.columns(6)
+        cards_b = [
+            ("Sharpe 值",     f"{best_b['sharpe']:.2f}",
+             f"{best_b['trigger']}  tgt={int(best_b['target'])}  stp={int(best_b['stop'])}", "pos"),
+            ("總損益",         f"{tp_b:+,} 元",   "最高 Sharpe 組合（2yr）", "pos" if tp_b>0 else "neg"),
+            ("TP 率",          fmt_pct(best_b["tp_rate"]),  "最高 Sharpe 組合", "pos"),
+            ("賺賠比",         f"{pf_b:.2f}",      "profit factor", "pos" if pf_b>=1 else "neg"),
+            ("期望值(元/筆)",  f"{int(ev_b):+,}",  "每筆平均損益", "pos" if ev_b>0 else "neg"),
+            ("正 Sharpe 組數", f"{(rdf_b['sharpe']>0).sum()}", f"共 {len(rdf_b)} 組", ""),
+        ]
+        for col, (lbl, val, sub, cls) in zip([c1,c2,c3,c4,c5,c6], cards_b):
+            col.markdown(kpi_card(lbl, val, sub, cls), unsafe_allow_html=True)
+
+        # ── Train / Test Split ──────────────────────────────────────
+        if not trades_b.empty and "date" in trades_b.columns:
+            trades_b = trades_b.copy()
+            trades_b["date"] = pd.to_datetime(trades_b["date"])
+
+            train_b = trades_b[trades_b["date"] < "2025-01-01"].copy()
+            test_b  = trades_b[trades_b["date"] >= "2025-01-01"].copy()
+
+            tr = period_stats(train_b, "pnl_twd")
+            te = period_stats(test_b,  "pnl_twd")
+
+            st.markdown("---")
+            sec("跨期間一致性驗證（最佳組合）")
+            st.caption("注意：最佳參數由完整 2 年資料選出，以下為同參數在不同期間的表現一致性驗證（非嚴格 Out-of-Sample）")
+
+            col_tr, col_te = st.columns(2)
+
+            with col_tr:
+                st.markdown("##### 訓練期 2024（參數選取基準，~240 交易日）")
+                if tr:
+                    t1,t2,t3,t4 = st.columns(4)
+                    for c, (l,v,s,cls) in zip([t1,t2,t3,t4], [
+                        ("Sharpe",   f"{tr['sharpe']:.2f}", f"{tr['trades']} 筆", sharpe_cls(tr['sharpe'])),
+                        ("損益",     f"{tr['total_pnl']:+,}", "元", "pos" if tr['total_pnl']>0 else "neg"),
+                        ("勝率",     f"{tr['win_rate']:.1f}%", "", "pos" if tr['win_rate']>=60 else "neu"),
+                        ("賺賠比",   f"{tr['pf']:.2f}", "", "pos" if tr['pf']>=1 else "neg"),
+                    ]):
+                        c.markdown(kpi_card(l,v,s,cls), unsafe_allow_html=True)
+                    cumulative_chart(train_b, "pnl_twd")
+
+            with col_te:
+                st.markdown("##### 測試期 2025~2026（真實驗證，~480 交易日）")
+                if te:
+                    t1,t2,t3,t4 = st.columns(4)
+                    for c, (l,v,s,cls) in zip([t1,t2,t3,t4], [
+                        ("Sharpe",   f"{te['sharpe']:.2f}", f"{te['trades']} 筆", sharpe_cls(te['sharpe'])),
+                        ("損益",     f"{te['total_pnl']:+,}", "元", "pos" if te['total_pnl']>0 else "neg"),
+                        ("勝率",     f"{te['win_rate']:.1f}%", "", "pos" if te['win_rate']>=60 else "neu"),
+                        ("賺賠比",   f"{te['pf']:.2f}", "", "pos" if te['pf']>=1 else "neg"),
+                    ]):
+                        c.markdown(kpi_card(l,v,s,cls), unsafe_allow_html=True)
+                    cumulative_chart(test_b, "pnl_twd")
+
+            # Consistency verdict
+            if tr and te:
+                robust = te["sharpe"] >= 0 and (tr["sharpe"] <= 0 or te["sharpe"] >= tr["sharpe"] * 0.5)
+                if robust and te["sharpe"] >= 2:
+                    vclass = "verdict-ok"
+                    verdict = f"✅ 測試期 Sharpe {te['sharpe']:.2f} 穩健（訓練期 {tr['sharpe']:.2f}），策略跨期間表現一致"
+                elif robust:
+                    vclass = "verdict-warn"
+                    verdict = f"⚠️ 測試期 Sharpe {te['sharpe']:.2f} 為正但偏低（訓練期 {tr['sharpe']:.2f}），建議持續監控"
+                else:
+                    vclass = "verdict-bad"
+                    verdict = f"❌ 測試期 Sharpe {te['sharpe']:.2f} 顯著低於訓練期 {tr['sharpe']:.2f}，有過擬合風險"
+                st.markdown(f'<div class="{vclass}" style="color:#e6edf3">{verdict}</div>', unsafe_allow_html=True)
+
+        # ── Monthly Table ───────────────────────────────────────────
+        if not trades_b.empty:
+            sec("月份穩定性（最佳組合，2024-2026）")
+            mth_b = monthly_table(trades_b, "pnl_twd")
+            if not mth_b.empty:
+                mth_b["損益(元)"] = mth_b["損益(元)"].apply(fmt_pnl)
+                st.dataframe(
+                    apply_style(mth_b, wr_col="勝率", pf_col="賺賠比", pnl_cols=["損益(元)"]),
+                    use_container_width=True, hide_index=True
+                )
+
+        # ── Overfitting Risk ────────────────────────────────────────
+        sec("過擬合風險評估")
+        col_ov1, col_ov2 = st.columns(2)
+
+        with col_ov1:
+            st.markdown("**各進場時間 最佳 Sharpe 分布**")
+            best_per_trig = (
+                rdf_b.loc[rdf_b.groupby("trigger")["sharpe"].idxmax()]
+                [["trigger","sharpe"]]
+                .sort_values("trigger")
+                .set_index("trigger")
+            )
+            st.bar_chart(best_per_trig, height=220)
+
+            top10_sharpes = rdf_b.nlargest(10, "sharpe")["sharpe"]
+            top1_val  = float(best_b["sharpe"])
+            top10_med = top10_sharpes.median()
+            st.markdown(f"**Top-1 Sharpe**: {top1_val:.2f} ｜ **Top-10 中位 Sharpe**: {top10_med:.2f}")
+            if top1_val > top10_med * 1.8:
+                st.warning("Top-1 遠高於 Top-10 中位，存在精選效應風險")
+            else:
+                st.success("Top-1 與 Top-10 中位接近，整體參數穩健")
+
+        with col_ov2:
+            st.markdown(f"**{best_b['trigger']} × stop={int(best_b['stop'])} × 各目標點 Sharpe**")
+            trig_sub = (
+                rdf_b[
+                    (rdf_b["trigger"] == best_b["trigger"]) &
+                    (rdf_b["stop"] == best_b["stop"])
+                ]
+                .groupby("target")["sharpe"].max()
+                .reset_index()
+                .set_index("target")
+            )
+            st.bar_chart(trig_sub, height=220)
+
+            pos_tgt   = (trig_sub["sharpe"] > 0).sum()
+            total_tgt = len(trig_sub)
+            stability = pos_tgt / total_tgt if total_tgt > 0 else 0
+            if stability >= 0.7:
+                st.success(f"止盈目標 {pos_tgt}/{total_tgt} 組 Sharpe > 0 ── 目標參數穩健")
+            elif stability >= 0.5:
+                st.warning(f"止盈目標 {pos_tgt}/{total_tgt} 組 Sharpe > 0 ── 部分區間不穩定")
+            else:
+                st.error(f"止盈目標 {pos_tgt}/{total_tgt} 組 Sharpe > 0 ── 參數敏感，謹慎使用")
+
+        # ── Filter + Full parameter table ───────────────────────────
+        sec("篩選器")
+        cf1, cf2, cf3, cf4 = st.columns(4)
+        trigs_b  = ["全部"] + sorted(rdf_b["trigger"].unique().tolist())
+        sel_tb   = cf1.selectbox("觸發時間", trigs_b, key="b_trig")
+        sel_stp  = cf2.selectbox("停損", ["全部","無停損(0)","有停損"], key="b_stp")
+        min_sb   = cf3.slider("最低 Sharpe", -10.0, 15.0, 0.0, 0.5, key="b_shr")
+        min_tp_b = cf4.slider("最低 TP 率 (%)", 0, 100, 0, 5, key="b_tp")
+
+        fdf_b = rdf_b.copy()
+        if sel_tb != "全部":        fdf_b = fdf_b[fdf_b["trigger"] == sel_tb]
+        if sel_stp == "無停損(0)":  fdf_b = fdf_b[fdf_b["stop"] == 0]
+        elif sel_stp == "有停損":   fdf_b = fdf_b[fdf_b["stop"] > 0]
+        fdf_b = fdf_b[(fdf_b["sharpe"] >= min_sb) & (fdf_b["tp_rate"] >= min_tp_b)]
+
+        COLS_B = ["trigger","target","stop","time_limit","trades",
+                  "tp_rate","sl_rate","timeout_rate","win_rate",
+                  "total_pnl","avg_pnl","profit_factor","expect_val","sharpe"]
+        COLS_B = [c for c in COLS_B if c in fdf_b.columns]
+
+        sec(f"全參數掃描（Sharpe 排序）— {len(fdf_b):,} 組符合")
+        disp_b = fdf_b.sort_values("sharpe", ascending=False).head(30)[COLS_B].copy()
+        for c in ["total_pnl","avg_pnl","expect_val"]:
+            if c in disp_b.columns: disp_b[c] = disp_b[c].apply(fmt_pnl)
+        for c in ["tp_rate","sl_rate","timeout_rate","win_rate"]:
+            if c in disp_b.columns: disp_b[c] = disp_b[c].apply(fmt_pct)
+        disp_b.columns = [c.replace("_"," ").title() for c in disp_b.columns]
+        st.dataframe(
+            apply_style(disp_b, sharpe_col="Sharpe", wr_col="Win Rate",
+                        pf_col="Profit Factor", pnl_cols=["Total Pnl","Avg Pnl","Expect Val"]),
+            use_container_width=True, hide_index=True, height=480
+        )
+
+        # ── Best per trigger time ───────────────────────────────────
+        sec("各進場時間最佳組合")
+        best_per_time = rdf_b.loc[rdf_b.groupby("trigger")["sharpe"].idxmax()][
+            [c for c in COLS_B if c in rdf_b.columns]].copy()
+        for c in ["total_pnl","avg_pnl","expect_val"]:
+            if c in best_per_time.columns: best_per_time[c] = best_per_time[c].apply(fmt_pnl)
+        for c in ["tp_rate","sl_rate","timeout_rate","win_rate"]:
+            if c in best_per_time.columns: best_per_time[c] = best_per_time[c].apply(fmt_pct)
+        best_per_time = best_per_time.sort_values("trigger")
+        best_per_time.columns = [c.replace("_"," ").title() for c in best_per_time.columns]
+        st.dataframe(
+            apply_style(best_per_time, sharpe_col="Sharpe", wr_col="Win Rate",
+                        pf_col="Profit Factor", pnl_cols=["Total Pnl","Avg Pnl","Expect Val"]),
+            use_container_width=True, hide_index=True
+        )
+
+        # ── Stop comparison ─────────────────────────────────────────
+        sec("停損對比（深入分析）")
+        col_l, col_r = st.columns(2)
+
+        with col_l:
+            st.markdown(f"**{best_b['trigger']} × 各停損設定（target={int(best_b['target'])}，每停損取最佳 tlim）**")
+            sub8 = (
+                rdf_b[
+                    (rdf_b["trigger"] == best_b["trigger"]) &
+                    (rdf_b["target"]  == best_b["target"])
+                ]
+                .sort_values(["stop","sharpe"], ascending=[True, False])
+                .drop_duplicates(subset=["stop"])[
+                    [c for c in COLS_B if c in rdf_b.columns]
+                ].copy()
+            )
+            for c in ["total_pnl","avg_pnl","expect_val"]:
+                if c in sub8.columns: sub8[c] = sub8[c].apply(fmt_pnl)
+            for c in ["tp_rate","sl_rate","timeout_rate","win_rate"]:
+                if c in sub8.columns: sub8[c] = sub8[c].apply(fmt_pct)
+            sub8.columns = [c.replace("_"," ").title() for c in sub8.columns]
+            st.dataframe(apply_style(sub8, sharpe_col="Sharpe", wr_col="Win Rate",
+                                     pf_col="Profit Factor", pnl_cols=["Total Pnl","Avg Pnl"]),
+                         use_container_width=True, hide_index=True)
+
+        with col_r:
+            st.markdown("**09:00 × 無停損 × 各時間限制**")
+            sub9 = rdf_b[(rdf_b["trigger"]=="09:00") & (rdf_b["stop"]==0)].sort_values("time_limit")[
+                [c for c in COLS_B if c in rdf_b.columns]].copy()
+            for c in ["total_pnl","avg_pnl","expect_val"]:
+                if c in sub9.columns: sub9[c] = sub9[c].apply(fmt_pnl)
+            for c in ["tp_rate","sl_rate","timeout_rate","win_rate"]:
+                if c in sub9.columns: sub9[c] = sub9[c].apply(fmt_pct)
+            sub9.columns = [c.replace("_"," ").title() for c in sub9.columns]
+            st.dataframe(apply_style(sub9, sharpe_col="Sharpe", wr_col="Win Rate",
+                                     pf_col="Profit Factor", pnl_cols=["Total Pnl","Avg Pnl"]),
+                         use_container_width=True, hide_index=True)
+
+        # ── Trade log ───────────────────────────────────────────────
+        if not trades_b.empty:
+            with st.expander("逐筆交易紀錄（最佳組合，按日期排序）"):
+                dt_b = date_sorted_table(trades_b, "pnl_twd", ["result","pnl_pts"])
+                dt_b.columns = [c.replace("_"," ").title() for c in dt_b.columns]
+                st.dataframe(dt_b, use_container_width=True, hide_index=True)
+
+        st.caption("⚠️ 夜盤方向濾網為合法前置資訊（前日 15:00～當日 05:00），無 Look-Ahead Bias")
 
 
 # ════════════════════════════════════════════════════════════════════
@@ -265,12 +541,10 @@ with tab_a:
         for col, (lbl, val, sub, cls) in zip([c1,c2,c3,c4,c5,c6], cards_a):
             col.markdown(kpi_card(lbl, val, sub, cls), unsafe_allow_html=True)
 
-        # 累積損益曲線
         if not trades_a.empty:
             sec("最佳組合累積損益曲線（按日期）")
             cumulative_chart(trades_a, "pnl_twd")
 
-        # 月份穩定性
         if not trades_a.empty:
             sec("月份穩定性（最佳組合）")
             mth_a = monthly_table(trades_a, "pnl_twd")
@@ -334,151 +608,7 @@ with tab_a:
                 dt_a.columns = [c.replace("_"," ").title() for c in dt_a.columns]
                 st.dataframe(dt_a, use_container_width=True, hide_index=True)
 
-        st.caption("⚠️ 參數掃描結果，請注意過擬合風險")
-
-
-# ════════════════════════════════════════════════════════════════════
-# TAB B
-# ════════════════════════════════════════════════════════════════════
-with tab_b:
-    sec("策略邏輯")
-    st.markdown("""
-    - **08:46 觸發**：夜盤（前日 15:00 ~ 當日 05:00）偏多才進
-    - **09:00 觸發**：08:46–08:59 偏多才進
-    - **停利**：掛 Limit sell 在 entry + target；**停損**：選配
-    - **時間停損**：time_limit 根 K 棒後市價平
-    """)
-
-    rdf_b, trades_b = load_scalp()
-
-    if rdf_b.empty:
-        st.info("回測資料尚未載入")
-    else:
-        best_b  = rdf_b.loc[rdf_b["sharpe"].idxmax()]
-        tp_b    = int(best_b["total_pnl"])
-        pf_b    = best_b.get("profit_factor", "—")
-        ev_b    = best_b.get("expect_val", best_b.get("avg_pnl", "—"))
-
-        c1,c2,c3,c4,c5,c6 = st.columns(6)
-        cards_b = [
-            ("Sharpe 值",    f"{best_b['sharpe']:.2f}",         f"{best_b['trigger']}  tgt={int(best_b['target'])} stp={int(best_b['stop'])} tlim={int(best_b['time_limit'])}", "pos"),
-            ("總損益",        f"{tp_b:+,} 元",                   "最高 Sharpe 組合", "pos" if tp_b>0 else "neg"),
-            ("TP 率",         fmt_pct(best_b["tp_rate"]),        "最高 Sharpe 組合", "pos"),
-            ("賺賠比",        f"{pf_b:.2f}",                     "win/loss ratio", "pos" if float(pf_b)>=1 else "neg"),
-            ("期望值(元/筆)", f"{int(float(ev_b)):+,}",          "每筆平均損益", "pos" if float(ev_b)>0 else "neg"),
-            ("正 Sharpe 組數",f"{(rdf_b['sharpe']>0).sum()}",   f"共 {len(rdf_b)} 組", ""),
-        ]
-        for col, (lbl, val, sub, cls) in zip([c1,c2,c3,c4,c5,c6], cards_b):
-            col.markdown(kpi_card(lbl, val, sub, cls), unsafe_allow_html=True)
-
-        # 累積損益曲線
-        if not trades_b.empty:
-            sec("最佳組合累積損益曲線（按日期）")
-            cumulative_chart(trades_b, "pnl_twd")
-
-        # 月份穩定性
-        if not trades_b.empty:
-            sec("月份穩定性（最佳組合）")
-            mth_b = monthly_table(trades_b, "pnl_twd")
-            if not mth_b.empty:
-                mth_b["損益(元)"] = mth_b["損益(元)"].apply(fmt_pnl)
-                st.dataframe(
-                    apply_style(mth_b, wr_col="勝率", pf_col="賺賠比", pnl_cols=["損益(元)"]),
-                    use_container_width=True, hide_index=True
-                )
-
-        sec("篩選器")
-        cf1, cf2, cf3, cf4 = st.columns(4)
-        trigs_b  = ["全部"] + sorted(rdf_b["trigger"].unique().tolist())
-        sel_tb   = cf1.selectbox("觸發時間", trigs_b, key="b_trig")
-        sel_stp  = cf2.selectbox("停損", ["全部","無停損(0)","有停損"], key="b_stp")
-        min_sb   = cf3.slider("最低 Sharpe", -10.0, 15.0, 0.0, 0.5, key="b_shr")
-        min_tp_b = cf4.slider("最低 TP 率 (%)", 0, 100, 0, 5, key="b_tp")
-
-        fdf_b = rdf_b.copy()
-        if sel_tb != "全部":       fdf_b = fdf_b[fdf_b["trigger"] == sel_tb]
-        if sel_stp == "無停損(0)": fdf_b = fdf_b[fdf_b["stop"] == 0]
-        elif sel_stp == "有停損":  fdf_b = fdf_b[fdf_b["stop"] > 0]
-        fdf_b = fdf_b[(fdf_b["sharpe"] >= min_sb) & (fdf_b["tp_rate"] >= min_tp_b)]
-
-        COLS_B = ["trigger","target","stop","time_limit","trades",
-                  "tp_rate","sl_rate","timeout_rate","win_rate",
-                  "total_pnl","avg_pnl","profit_factor","expect_val","sharpe"]
-        COLS_B = [c for c in COLS_B if c in fdf_b.columns]
-
-        sec(f"Top 30（Sharpe）— {len(fdf_b):,} 組符合")
-        disp_b = fdf_b.sort_values("sharpe", ascending=False).head(30)[COLS_B].copy()
-        for c in ["total_pnl","avg_pnl","expect_val"]:
-            if c in disp_b.columns: disp_b[c] = disp_b[c].apply(fmt_pnl)
-        for c in ["tp_rate","sl_rate","timeout_rate","win_rate"]:
-            if c in disp_b.columns: disp_b[c] = disp_b[c].apply(fmt_pct)
-        disp_b.columns = [c.replace("_"," ").title() for c in disp_b.columns]
-        st.dataframe(
-            apply_style(disp_b, sharpe_col="Sharpe", wr_col="Win Rate",
-                        pf_col="Profit Factor", pnl_cols=["Total Pnl","Avg Pnl","Expect Val"]),
-            use_container_width=True, hide_index=True, height=480
-        )
-
-        # ── 各進場時間最佳 Sharpe ──
-        if "section" in rdf_b.columns or "trigger" in rdf_b.columns:
-            sec("各進場時間最佳組合（待 2 年資料重跑後更新）")
-            grp_col = "trigger"
-            if grp_col in rdf_b.columns:
-                best_per_time = rdf_b.loc[rdf_b.groupby(grp_col)["sharpe"].idxmax()][
-                    [c for c in COLS_B if c in rdf_b.columns]].copy()
-                for c in ["total_pnl","avg_pnl","expect_val"]:
-                    if c in best_per_time.columns: best_per_time[c] = best_per_time[c].apply(fmt_pnl)
-                for c in ["tp_rate","sl_rate","timeout_rate","win_rate"]:
-                    if c in best_per_time.columns: best_per_time[c] = best_per_time[c].apply(fmt_pct)
-                best_per_time = best_per_time.sort_values(grp_col)
-                best_per_time.columns = [c.replace("_"," ").title() for c in best_per_time.columns]
-                st.dataframe(
-                    apply_style(best_per_time, sharpe_col="Sharpe", wr_col="Win Rate",
-                                pf_col="Profit Factor", pnl_cols=["Total Pnl","Avg Pnl","Expect Val"]),
-                    use_container_width=True, hide_index=True
-                )
-
-        sec("停損對比（最佳進場時間 × 各停損設定）")
-        col_l, col_r = st.columns(2)
-        with col_l:
-            st.markdown("**09:00 × 無停損 × 各時間限制**")
-            sub9 = rdf_b[(rdf_b["trigger"]=="09:00") & (rdf_b["stop"]==0)].sort_values("time_limit")[
-                [c for c in COLS_B if c in rdf_b.columns]].copy()
-            if sub9.empty:
-                sub9 = rdf_b[(rdf_b["trigger"].str.contains("現貨|09:00", na=False)) & (rdf_b["stop"]==0)].sort_values("time_limit")[
-                    [c for c in COLS_B if c in rdf_b.columns]].copy()
-            for c in ["total_pnl","avg_pnl","expect_val"]:
-                if c in sub9.columns: sub9[c] = sub9[c].apply(fmt_pnl)
-            for c in ["tp_rate","sl_rate","timeout_rate","win_rate"]:
-                if c in sub9.columns: sub9[c] = sub9[c].apply(fmt_pct)
-            sub9.columns = [c.replace("_"," ").title() for c in sub9.columns]
-            st.dataframe(apply_style(sub9, sharpe_col="Sharpe", wr_col="Win Rate",
-                                     pf_col="Profit Factor", pnl_cols=["Total Pnl","Avg Pnl"]),
-                         use_container_width=True, hide_index=True)
-
-        with col_r:
-            st.markdown("**08:46 × time_limit=5 × 各停損**")
-            sub8 = rdf_b[(rdf_b["trigger"]=="08:46") & (rdf_b["time_limit"]==5)].sort_values("stop")[
-                [c for c in COLS_B if c in rdf_b.columns]].copy()
-            if sub8.empty:
-                sub8 = rdf_b[(rdf_b["trigger"].str.contains("期貨|08:46", na=False)) & (rdf_b["time_limit"]==5)].sort_values("stop")[
-                    [c for c in COLS_B if c in rdf_b.columns]].copy()
-            for c in ["total_pnl","avg_pnl","expect_val"]:
-                if c in sub8.columns: sub8[c] = sub8[c].apply(fmt_pnl)
-            for c in ["tp_rate","sl_rate","timeout_rate","win_rate"]:
-                if c in sub8.columns: sub8[c] = sub8[c].apply(fmt_pct)
-            sub8.columns = [c.replace("_"," ").title() for c in sub8.columns]
-            st.dataframe(apply_style(sub8, sharpe_col="Sharpe", wr_col="Win Rate",
-                                     pf_col="Profit Factor", pnl_cols=["Total Pnl","Avg Pnl"]),
-                         use_container_width=True, hide_index=True)
-
-        if not trades_b.empty:
-            with st.expander("逐筆交易紀錄（最佳組合，按日期排序）"):
-                dt_b = date_sorted_table(trades_b, "pnl_twd", ["result","pnl_pts"])
-                dt_b.columns = [c.replace("_"," ").title() for c in dt_b.columns]
-                st.dataframe(dt_b, use_container_width=True, hide_index=True)
-
-        st.caption("⚠️ 夜盤方向濾網為合法前置資訊（前日 15:00～當日 05:00）")
+        st.caption("⚠️ 參數掃描結果，請注意過擬合風險（3,920 組合）")
 
 
 # ════════════════════════════════════════════════════════════════════
@@ -517,7 +647,6 @@ with tab_c:
         c3.markdown(kpi_card("Tick 目標", f"{ticks[0]}~{ticks[-1]}" if ticks else "—", "1~8 tick", ""), unsafe_allow_html=True)
         c4.markdown(kpi_card("資料品質", "1-min K 棒" if is_1min else "日頻上限", "", "pos" if is_1min else "neu"), unsafe_allow_html=True)
 
-        # 彙總表
         if is_1min:
             sec("各 Tick × 時間窗口 表現（1-min K 棒，精確）")
             sel_tw = st.selectbox("時間窗口（分鐘）", ["全部"] + [str(w) for w in windows], key="c_tw")
@@ -568,12 +697,11 @@ with tab_c:
                 use_container_width=True, hide_index=True
             )
 
-        # 累積損益曲線（最佳組合）
         if summary_rows and "date" in rdf_c.columns:
-            best_row_c = max(summary_rows, key=lambda r: float(r["Sharpe"]))
+            best_row_c  = max(summary_rows, key=lambda r: float(r["Sharpe"]))
             best_tick_c = best_row_c["tick 目標"]
             best_tw_c   = best_row_c.get("時間窗口(min)", None)
-            mask_best = rdf_c["tick"] == best_tick_c
+            mask_best   = rdf_c["tick"] == best_tick_c
             if is_1min and best_tw_c:
                 mask_best &= rdf_c["time_window"] == best_tw_c
             t_best_c = rdf_c[mask_best].copy()
@@ -654,7 +782,6 @@ with tab_tsmc:
         windows_t = sorted(rdf_t["time_window"].unique().tolist()) if "time_window" in rdf_t.columns else []
         tdays_t   = rdf_t["date"].nunique() if "date" in rdf_t.columns else 0
 
-        # 彙總
         summary_t = []
         for n in ticks_t:
             for tw in windows_t:
@@ -670,7 +797,7 @@ with tab_tsmc:
                 loss_avg = t[t["pnl"] < 0]["pnl"].mean() if losses else 0
                 pf = abs(win_avg * wins / (loss_avg * losses)) if losses > 0 and loss_avg != 0 else 99.0
                 summary_t.append({
-                    "tick":     n, "時間窗口(min)": tw, "交易日": total,
+                    "tick": n, "時間窗口(min)": tw, "交易日": total,
                     "TP 率":   f"{tp_n/total*100:.1f}%",
                     "勝率":    f"{wins/total*100:.1f}%",
                     "賺賠比":  round(pf, 2),
@@ -703,7 +830,6 @@ with tab_tsmc:
                 use_container_width=True, hide_index=True
             )
 
-        # 累積損益曲線（最佳組合）
         if best_t and "date" in rdf_t.columns:
             t_best_t = rdf_t[(rdf_t["tick"] == best_t["tick"]) &
                              (rdf_t["time_window"] == best_t["時間窗口(min)"])].copy()
