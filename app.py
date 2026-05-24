@@ -72,6 +72,11 @@ def load_scalp():
 
 
 @st.cache_data(ttl=300)
+def load_tsmc():
+    return _read_csv("results_tsmc.csv")
+
+
+@st.cache_data(ttl=300)
 def load_stock_scalp():
     df = _read_csv("results_stock_scalp_1min.csv")
     if df.empty:
@@ -224,7 +229,7 @@ def date_sorted_table(trades_df: pd.DataFrame, pnl_col: str, extra_cols: list = 
 st.markdown("## 📊 TMF 微型台指期貨 — 回測儀表板")
 st.caption("資料期間：2026-02-23 ~ 2026-05-23（74 交易日）｜手續費：NT$40 round-trip（4 點）")
 
-tab_a, tab_b, tab_c = st.tabs(["策略 A：波動突破", "策略 B：固定時間進多", "策略 C：前日強勢大型股"])
+tab_a, tab_b, tab_c, tab_tsmc = st.tabs(["策略 A：波動突破", "策略 B：固定時間進多", "策略 C：前日強勢大型股", "策略 D：台積電單股"])
 
 
 # ════════════════════════════════════════════════════════════════════
@@ -615,4 +620,142 @@ with tab_c:
             rdf_c.to_csv(index=False, encoding="utf-8-sig").encode("utf-8-sig"),
             "results_stock_scalp_1min.csv" if is_1min else "results_stock_scalp.csv",
             "text/csv",
+        )
+
+
+# ════════════════════════════════════════════════════════════════════
+# TAB D：台積電單股
+# ════════════════════════════════════════════════════════════════════
+with tab_tsmc:
+    sec("策略邏輯")
+    st.markdown("""
+    - **選股**：只做台積電（2330），不篩選前日強弱
+    - **進場條件**：MXF 08:46–08:59 偏多才進場
+    - **進場**：09:01 開盤第一根 K 棒（漲停略過）
+    - **停利**：N tick，時間窗口（5/10/15/20/30 min）內達到即觸發
+    - **停損**：時間到市價平（純時間停損）
+    - **資料期間**：2024-01-02 ~ 2026-05-22（576 個交易日）
+    - **手續費**：1.6折 + 當沖稅減半
+    """)
+
+    st.markdown("""
+    <div style="background:#1c2128;border:1px solid #f0883e;border-radius:8px;padding:12px 16px;margin:8px 0;">
+    ⚠️ <strong>手續費陷阱：</strong>台積電在 800 元時，1 tick TP = 1,000 元，但手續費高達 ~1,565 元，連 TP 也虧損。<br>
+    只有台積電在 <strong>1,000 元以上</strong>（tick=5元）才有足夠利潤空間。
+    </div>
+    """, unsafe_allow_html=True)
+
+    rdf_t = load_tsmc()
+
+    if rdf_t.empty:
+        st.info("回測資料尚未載入")
+    else:
+        ticks_t   = sorted(rdf_t["tick"].unique().tolist()) if "tick" in rdf_t.columns else []
+        windows_t = sorted(rdf_t["time_window"].unique().tolist()) if "time_window" in rdf_t.columns else []
+        tdays_t   = rdf_t["date"].nunique() if "date" in rdf_t.columns else 0
+
+        # 彙總
+        summary_t = []
+        for n in ticks_t:
+            for tw in windows_t:
+                t = rdf_t[(rdf_t["tick"] == n) & (rdf_t["time_window"] == tw)]
+                if t.empty: continue
+                wins   = (t["pnl"] > 0).sum()
+                losses = (t["pnl"] < 0).sum()
+                tp_n   = (t["result"] == "TP").sum()
+                total  = len(t)
+                std    = t["pnl"].std()
+                sharpe = t["pnl"].mean() / std * np.sqrt(252) if std > 0 else 0
+                win_avg  = t[t["pnl"] > 0]["pnl"].mean() if wins else 0
+                loss_avg = t[t["pnl"] < 0]["pnl"].mean() if losses else 0
+                pf = abs(win_avg * wins / (loss_avg * losses)) if losses > 0 and loss_avg != 0 else 99.0
+                summary_t.append({
+                    "tick":     n, "時間窗口(min)": tw, "交易日": total,
+                    "TP 率":   f"{tp_n/total*100:.1f}%",
+                    "勝率":    f"{wins/total*100:.1f}%",
+                    "賺賠比":  round(pf, 2),
+                    "Sharpe":  round(sharpe, 2),
+                    "期望值(元)": round(t["pnl"].mean(), 0),
+                    "總損益(元)": int(t["pnl"].sum()),
+                })
+
+        c1, c2, c3 = st.columns(3)
+        c1.markdown(kpi_card("回測交易日", str(tdays_t), "MXF 偏多", ""), unsafe_allow_html=True)
+        best_t = max(summary_t, key=lambda r: float(r["Sharpe"])) if summary_t else {}
+        c2.markdown(kpi_card("最佳 Sharpe", f"{best_t.get('Sharpe', '—'):.2f}" if best_t else "—",
+                             f"{best_t.get('tick','?')} tick × {best_t.get('時間窗口(min)','?')} min" if best_t else "",
+                             "pos" if best_t and float(best_t.get("Sharpe","-99")) > 0 else "neg"),
+                    unsafe_allow_html=True)
+        c3.markdown(kpi_card("價格範圍", "574 ~ 2,340 元", "tick=1(≤1000) / tick=5(>1000)", "neu"),
+                    unsafe_allow_html=True)
+
+        sec("各 Tick × 時間窗口 表現")
+        sel_tw_t = st.selectbox("時間窗口（分鐘）", ["全部"] + [str(w) for w in windows_t], key="t_tw")
+        if summary_t:
+            sdf_t = pd.DataFrame(summary_t)
+            if sel_tw_t != "全部":
+                sdf_t = sdf_t[sdf_t["時間窗口(min)"] == int(sel_tw_t)]
+            sdf_t_d = sdf_t.copy()
+            sdf_t_d["總損益(元)"] = sdf_t_d["總損益(元)"].apply(fmt_pnl)
+            st.dataframe(
+                apply_style(sdf_t_d, sharpe_col="Sharpe", wr_col="勝率",
+                            pf_col="賺賠比", pnl_cols=["總損益(元)"]),
+                use_container_width=True, hide_index=True
+            )
+
+        # 累積損益曲線（最佳組合）
+        if best_t and "date" in rdf_t.columns:
+            t_best_t = rdf_t[(rdf_t["tick"] == best_t["tick"]) &
+                             (rdf_t["time_window"] == best_t["時間窗口(min)"])].copy()
+            label_t = f"{best_t['tick']} tick × {best_t['時間窗口(min)']} min"
+            sec(f"累積損益曲線（{label_t}，按日期）")
+            cumulative_chart(t_best_t, "pnl")
+
+            sec(f"月份穩定性（{label_t}）")
+            mth_t = monthly_table(t_best_t, "pnl")
+            if not mth_t.empty:
+                mth_t["損益(元)"] = mth_t["損益(元)"].apply(fmt_pnl)
+                st.dataframe(
+                    apply_style(mth_t, wr_col="勝率", pf_col="賺賠比", pnl_cols=["損益(元)"]),
+                    use_container_width=True, hide_index=True
+                )
+
+        sec("分析：為何台積電表現有明顯週期性？")
+        col_t1, col_t2 = st.columns(2)
+        with col_t1:
+            st.markdown("""
+            **虧損期（2024 上半年）**
+            - 台積電 ~600-850 元，tick = **1 元**
+            - 手續費 = 0.1956% × 800 × 1000 ≈ **1,565 元**
+            - 1 tick TP = 1 × 1000 = **1,000 元**
+            - TP 也虧 565 元，完全無利可圖
+
+            **盈利期（2024 Q4 ~ 2025 Q1）**
+            - 台積電 ~1,100-1,300 元，tick = **5 元**
+            - 手續費 ≈ **2,347 元**
+            - 1 tick TP = 5 × 1000 = **5,000 元**
+            - 淨 TP = 2,653 元，空間充足
+            """)
+        with col_t2:
+            st.markdown("""
+            **改進方向**
+            1. **只在台積電 >1,000 元時啟動策略**（動態開關）
+            2. **增加趨勢濾網**：台積電高於 20MA 才做多
+            3. **調大 tick 目標**：≥3 tick，確保扣除手續費後仍有獲利
+            4. **加入前日強弱**：台積電前日也要收漲才進場
+            5. **組合下單**：與 MXF 策略對沖，降低整體波動
+            """)
+
+        with st.expander("逐筆交易紀錄（最佳組合，按日期排序）"):
+            if best_t:
+                t_best_t = rdf_t[(rdf_t["tick"] == best_t["tick"]) &
+                                 (rdf_t["time_window"] == best_t["時間窗口(min)"])].copy()
+                dt_t = date_sorted_table(t_best_t, "pnl", ["result","entry","tick"])
+                dt_t.columns = [c.replace("_"," ").title() for c in dt_t.columns]
+                st.dataframe(dt_t, use_container_width=True, hide_index=True)
+
+        st.download_button(
+            "下載台積電明細 CSV",
+            rdf_t.to_csv(index=False, encoding="utf-8-sig").encode("utf-8-sig"),
+            "results_tsmc.csv", "text/csv",
         )
