@@ -250,7 +250,7 @@ with tab_a:
 
         c1,c2,c3,c4,c5,c6 = st.columns(6)
         cards_a = [
-            ("最佳 Sharpe",   f"{best_a['sharpe']:.2f}",     f"{best_a['trigger']}", "pos"),
+            ("Sharpe 值",     f"{best_a['sharpe']:.2f}",     f"{best_a['trigger']}", "pos"),
             ("總損益",         f"{tp_a:+,} 元",                "最高 Sharpe 組合", "pos" if tp_a>0 else "neg"),
             ("勝率",           fmt_pct(best_a["win_rate"]),    "最高 Sharpe 組合", ""),
             ("賺賠比",         f"{pf_a:.2f}",                  "profit factor", "pos" if float(pf_a)>=1 else "neg"),
@@ -356,10 +356,10 @@ with tab_b:
 
         c1,c2,c3,c4,c5,c6 = st.columns(6)
         cards_b = [
-            ("最佳 Sharpe",  f"{best_b['sharpe']:.2f}",        f"{best_b['trigger']}  tgt={int(best_b['target'])} stp={int(best_b['stop'])} tlim={int(best_b['time_limit'])}", "pos"),
+            ("Sharpe 值",    f"{best_b['sharpe']:.2f}",         f"{best_b['trigger']}  tgt={int(best_b['target'])} stp={int(best_b['stop'])} tlim={int(best_b['time_limit'])}", "pos"),
             ("總損益",        f"{tp_b:+,} 元",                   "最高 Sharpe 組合", "pos" if tp_b>0 else "neg"),
             ("TP 率",         fmt_pct(best_b["tp_rate"]),        "最高 Sharpe 組合", "pos"),
-            ("賺賠比",        f"{pf_b:.2f}",                     "profit factor", "pos" if float(pf_b)>=1 else "neg"),
+            ("賺賠比",        f"{pf_b:.2f}",                     "win/loss ratio", "pos" if float(pf_b)>=1 else "neg"),
             ("期望值(元/筆)", f"{int(float(ev_b)):+,}",          "每筆平均損益", "pos" if float(ev_b)>0 else "neg"),
             ("正 Sharpe 組數",f"{(rdf_b['sharpe']>0).sum()}",   f"共 {len(rdf_b)} 組", ""),
         ]
@@ -414,13 +414,34 @@ with tab_b:
             use_container_width=True, hide_index=True, height=480
         )
 
-        sec("策略細分對比")
-        col_l, col_r = st.columns(2)
+        # ── 各進場時間最佳 Sharpe ──
+        if "section" in rdf_b.columns or "trigger" in rdf_b.columns:
+            sec("各進場時間最佳組合（待 2 年資料重跑後更新）")
+            grp_col = "trigger"
+            if grp_col in rdf_b.columns:
+                best_per_time = rdf_b.loc[rdf_b.groupby(grp_col)["sharpe"].idxmax()][
+                    [c for c in COLS_B if c in rdf_b.columns]].copy()
+                for c in ["total_pnl","avg_pnl","expect_val"]:
+                    if c in best_per_time.columns: best_per_time[c] = best_per_time[c].apply(fmt_pnl)
+                for c in ["tp_rate","sl_rate","timeout_rate","win_rate"]:
+                    if c in best_per_time.columns: best_per_time[c] = best_per_time[c].apply(fmt_pct)
+                best_per_time = best_per_time.sort_values(grp_col)
+                best_per_time.columns = [c.replace("_"," ").title() for c in best_per_time.columns]
+                st.dataframe(
+                    apply_style(best_per_time, sharpe_col="Sharpe", wr_col="Win Rate",
+                                pf_col="Profit Factor", pnl_cols=["Total Pnl","Avg Pnl","Expect Val"]),
+                    use_container_width=True, hide_index=True
+                )
 
+        sec("停損對比（最佳進場時間 × 各停損設定）")
+        col_l, col_r = st.columns(2)
         with col_l:
             st.markdown("**09:00 × 無停損 × 各時間限制**")
-            sub9 = rdf_b[(rdf_b["trigger"]=="現貨開盤") & (rdf_b["stop"]==0)].sort_values("time_limit")[
+            sub9 = rdf_b[(rdf_b["trigger"]=="09:00") & (rdf_b["stop"]==0)].sort_values("time_limit")[
                 [c for c in COLS_B if c in rdf_b.columns]].copy()
+            if sub9.empty:
+                sub9 = rdf_b[(rdf_b["trigger"].str.contains("現貨|09:00", na=False)) & (rdf_b["stop"]==0)].sort_values("time_limit")[
+                    [c for c in COLS_B if c in rdf_b.columns]].copy()
             for c in ["total_pnl","avg_pnl","expect_val"]:
                 if c in sub9.columns: sub9[c] = sub9[c].apply(fmt_pnl)
             for c in ["tp_rate","sl_rate","timeout_rate","win_rate"]:
@@ -432,8 +453,11 @@ with tab_b:
 
         with col_r:
             st.markdown("**08:46 × time_limit=5 × 各停損**")
-            sub8 = rdf_b[(rdf_b["trigger"]=="期貨開盤") & (rdf_b["time_limit"]==5)].sort_values("stop")[
+            sub8 = rdf_b[(rdf_b["trigger"]=="08:46") & (rdf_b["time_limit"]==5)].sort_values("stop")[
                 [c for c in COLS_B if c in rdf_b.columns]].copy()
+            if sub8.empty:
+                sub8 = rdf_b[(rdf_b["trigger"].str.contains("期貨|08:46", na=False)) & (rdf_b["time_limit"]==5)].sort_values("stop")[
+                    [c for c in COLS_B if c in rdf_b.columns]].copy()
             for c in ["total_pnl","avg_pnl","expect_val"]:
                 if c in sub8.columns: sub8[c] = sub8[c].apply(fmt_pnl)
             for c in ["tp_rate","sl_rate","timeout_rate","win_rate"]:
