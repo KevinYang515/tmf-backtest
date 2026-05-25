@@ -220,7 +220,7 @@ def monthly_table(trades_df: pd.DataFrame, pnl_col: str):
 def date_sorted_table(trades_df: pd.DataFrame, pnl_col: str, extra_cols: list = None):
     if trades_df.empty:
         return pd.DataFrame()
-    cols = ["date", "result", pnl_col] + (extra_cols or [])
+    cols = list(dict.fromkeys(["date", "result", pnl_col] + (extra_cols or [])))
     cols = [c for c in cols if c in trades_df.columns]
     tdf = trades_df[cols].sort_values("date").copy()
     tdf[pnl_col] = tdf[pnl_col].apply(fmt_pnl)
