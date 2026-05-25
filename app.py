@@ -656,12 +656,27 @@ with tab_b_exit:
         - 固定進場：08:46 夜盤偏多，止損固定 5 pts
         """)
     else:
-        # KPI summary
-        best_by_mode = rdf_e.loc[rdf_e.groupby("mode")["sharpe"].idxmax()]
+        # ── Simulation bias warning ───────────────────────────────────────
+        st.markdown("""
+        <div class="verdict-warn">
+        ⚠️ <strong>Trailing Stop 模擬偏差說明</strong><br>
+        1 分鐘 K 棒只有 OHLC，無法確定 High 與 Low 的先後順序。
+        「樂觀版（trailing）」假設先漲到 High 再跌到 Low，EV 被高估；
+        「保守版（trailing_cons）」假設先跌到 Low 再更新 High，EV 被低估。
+        兩者為移動停利的上下限，真實績效介於兩者之間。
+        Partial TP 無此問題（固定掛單，順序不影響結果）。
+        </div>
+        """, unsafe_allow_html=True)
 
-        c1, c2, c3 = st.columns(3)
-        for col, (_, row) in zip([c1, c2, c3], best_by_mode.iterrows()):
-            mode_name = {"full_tp": "Full TP", "partial_tp": "Partial TP", "trailing": "Trailing Stop"}.get(row["mode"], row["mode"])
+        # ── KPI summary (4 modes) ─────────────────────────────────────────
+        best_by_mode = rdf_e.loc[rdf_e.groupby("mode")["sharpe"].idxmax()].reset_index(drop=True)
+        mode_display = {
+            "full_tp": "Full TP", "partial_tp": "Partial TP",
+            "trailing": "Trailing（樂觀）", "trailing_cons": "Trailing（保守）",
+        }
+        c1, c2, c3, c4 = st.columns(4)
+        for col, (_, row) in zip([c1, c2, c3, c4], best_by_mode.iterrows()):
+            mode_name = mode_display.get(row["mode"], row["mode"])
             col.markdown(kpi_card(
                 f"最佳 {mode_name}",
                 f"Sharpe {row['sharpe']:.2f}",
@@ -669,8 +684,8 @@ with tab_b_exit:
                 sharpe_cls(row["sharpe"])
             ), unsafe_allow_html=True)
 
-        # Comparison table
-        sec("三種出場方式全比較（Sharpe 排序）")
+        # ── Comparison table ──────────────────────────────────────────────
+        sec("四種出場方式全比較（Sharpe 排序）")
         disp_cols = ["mode","label","trades","win_rate","ev_twd","total_pnl","pf","sharpe"]
         disp_cols = [c for c in disp_cols if c in rdf_e.columns]
         disp_e = rdf_e.sort_values("sharpe", ascending=False)[disp_cols].copy()
@@ -680,29 +695,37 @@ with tab_b_exit:
         disp_e.columns      = [c.replace("_"," ").title() for c in disp_e.columns]
         st.dataframe(apply_style(disp_e, sharpe_col="Sharpe", pf_col="Pf",
                                  pnl_cols=["Total Pnl","Ev Twd"]),
-                     use_container_width=True, hide_index=True, height=480)
+                     use_container_width=True, hide_index=True, height=520)
 
-        # Best per mode bar chart
-        sec("各模式最佳 Sharpe 比較")
-        bar_data = best_by_mode.set_index("mode")[["sharpe"]].rename(index={
-            "full_tp": "Full TP", "partial_tp": "Partial TP", "trailing": "Trailing"})
-        st.bar_chart(bar_data, height=200)
+        # ── Best per mode bar chart ───────────────────────────────────────
+        sec("各模式最佳 Sharpe 比較（含 Trailing 上下限）")
+        bar_data = best_by_mode.set_index("mode")[["sharpe"]].rename(index=mode_display)
+        st.bar_chart(bar_data, height=220)
 
-        # EV comparison
+        # ── EV comparison ─────────────────────────────────────────────────
         sec("各模式最佳期望值（元/筆）比較")
-        ev_data = best_by_mode.set_index("mode")[["ev_twd"]].rename(index={
-            "full_tp": "Full TP", "partial_tp": "Partial TP", "trailing": "Trailing"})
-        st.bar_chart(ev_data, height=200)
+        ev_data = best_by_mode.set_index("mode")[["ev_twd"]].rename(index=mode_display)
+        st.bar_chart(ev_data, height=220)
 
-        # Monthly tables for best of each mode
+        # ── Monthly tables for best of each mode ─────────────────────────
         if not trades_e.empty:
             sec("月份穩定性（各模式最佳組合）")
-            tabs_modes = st.tabs(["Full TP", "Partial TP", "Trailing Stop"])
-            for tab_m, mode in zip(tabs_modes, ["full_tp", "partial_tp", "trailing"]):
+            tab_labels = ["Full TP", "Partial TP", "Trailing（樂觀）", "Trailing（保守）"]
+            tab_modes  = ["full_tp", "partial_tp", "trailing", "trailing_cons"]
+            tabs_modes = st.tabs(tab_labels)
+            for tab_m, mode in zip(tabs_modes, tab_modes):
                 with tab_m:
-                    best_lbl = rdf_e[rdf_e["mode"] == mode].sort_values("sharpe", ascending=False).iloc[0]["label"]
+                    mode_df = rdf_e[rdf_e["mode"] == mode]
+                    if mode_df.empty:
+                        st.info("無此模式資料")
+                        continue
+                    best_lbl = mode_df.sort_values("sharpe", ascending=False).iloc[0]["label"]
                     t_mode   = trades_e[trades_e["label"] == best_lbl].copy()
                     st.markdown(f"**{best_lbl}**")
+                    if mode == "trailing":
+                        st.markdown('<div class="verdict-warn">⚠️ 樂觀版：High-first 假設，績效為上限</div>', unsafe_allow_html=True)
+                    elif mode == "trailing_cons":
+                        st.markdown('<div class="verdict-warn">⚠️ 保守版：Low-first 假設，績效為下限</div>', unsafe_allow_html=True)
                     col_chart, col_mth = st.columns([1, 1])
                     with col_chart:
                         cumulative_chart(t_mode, "pnl_pts")
@@ -714,17 +737,27 @@ with tab_b_exit:
                                                      pnl_cols=["損益(元)"]),
                                          use_container_width=True, hide_index=True)
 
-        # Conclusion
+        # ── Conclusion ────────────────────────────────────────────────────
         sec("結論與建議")
-        if not rdf_e.empty:
-            best_overall = rdf_e.loc[rdf_e["sharpe"].idxmax()]
-            mode_zh = {"full_tp": "Full TP（全倉停利）", "partial_tp": "Partial TP（部分停利）",
-                       "trailing": "Trailing Stop（移動停利）"}.get(best_overall["mode"], best_overall["mode"])
+        best_partial = rdf_e[rdf_e["mode"] == "partial_tp"].sort_values("sharpe", ascending=False).iloc[0] if not rdf_e[rdf_e["mode"] == "partial_tp"].empty else None
+        best_cons    = rdf_e[rdf_e["mode"] == "trailing_cons"].sort_values("sharpe", ascending=False).iloc[0] if not rdf_e[rdf_e["mode"] == "trailing_cons"].empty else None
+        best_full    = rdf_e[rdf_e["mode"] == "full_tp"].sort_values("sharpe", ascending=False).iloc[0] if not rdf_e[rdf_e["mode"] == "full_tp"].empty else None
+        if best_partial is not None:
             st.markdown(f"""
             <div class="verdict-ok">
-            ✅ 最佳出場方式：<strong>{mode_zh}</strong>（{best_overall['label']}）<br>
-            Sharpe {best_overall['sharpe']:.2f}｜期望值 {best_overall['ev_twd']:+.1f} 元/筆｜
-            勝率 {best_overall['win_rate']:.1f}%｜賺賠比 {best_overall['pf']:.2f}
+            ✅ <strong>推薦出場方式：Partial TP（{best_partial['label']}）</strong><br>
+            Sharpe {best_partial['sharpe']:.2f}｜期望值 {best_partial['ev_twd']:+.1f} 元/筆｜
+            勝率 {best_partial['win_rate']:.1f}%｜賺賠比 {best_partial['pf']:.2f}<br>
+            <small>無模擬偏差問題，實盤掛兩檔限價單即可執行，不需 tick 監控</small>
+            </div>
+            """, unsafe_allow_html=True)
+        if best_cons is not None and best_full is not None:
+            st.markdown(f"""
+            <div class="verdict-warn">
+            📊 <strong>Trailing Stop 真實績效範圍</strong><br>
+            樂觀上限（High-first）：Sharpe {rdf_e[rdf_e["mode"]=="trailing"]["sharpe"].max():.2f}<br>
+            保守下限（Low-first）：Sharpe {best_cons['sharpe']:.2f}（{best_cons['label']}，EV={best_cons['ev_twd']:+.1f}元）<br>
+            <small>實際績效介於 Sharpe {best_cons['sharpe']:.2f}～{rdf_e[rdf_e["mode"]=="trailing"]["sharpe"].max():.2f} 之間；若接受此不確定性，Shioaji 需自行實作 tick 監控</small>
             </div>
             """, unsafe_allow_html=True)
 
